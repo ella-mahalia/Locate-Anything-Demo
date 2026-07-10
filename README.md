@@ -1,5 +1,5 @@
-# Locate-Anything-Demo
-This study investigates NVIDIA's LocateAnything-3B.
+## Locate-Anything-Demo
+
 
 This study investigates NVIDIA's LocateAnything-3B, a vision-language grounding model that uses natural-language suggestions to find items in pictures. 
 Street, office, grocery shop, and clothes store scenarios with varying degrees of visual complexity were used to evaluate the model.
