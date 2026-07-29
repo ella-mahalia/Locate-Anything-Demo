@@ -1,8 +1,5 @@
 ## Locate-Anything-Demo
 
-
-# Locate Anything Demo
-
 This project demonstrates NVIDIA's **LocateAnything-3B**, a vision-language grounding model that locates objects in images using natural-language prompts.
 
 The application includes a Gradio interface that allows users to upload an image, describe what they want to locate, and view the detected objects with bounding boxes or points.
