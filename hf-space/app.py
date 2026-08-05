@@ -1,8 +1,16 @@
+"""Locate Anything 3B — Hugging Face Space app (ZeroGPU).
+
+Adapted from the project repo's app.py. The only difference is ZeroGPU
+scheduling: the model loads onto CPU at startup and is moved to the GPU
+inside @spaces.GPU on the first inference call. The Gradio UI (build_demo)
+is identical to the local/Colab version so the demo looks the same everywhere.
+"""
 import os
 import re
 from typing import Any
 
 import gradio as gr
+import spaces  # ZeroGPU — preinstalled on Gradio SDK Spaces
 import torch
 from PIL import Image, ImageDraw, ImageFont
 from transformers import AutoModel, AutoProcessor, AutoTokenizer
@@ -10,25 +18,17 @@ from transformers import AutoModel, AutoProcessor, AutoTokenizer
 MODEL_ID = os.getenv("MODEL_ID", "nvidia/LocateAnything-3B")
 HF_TOKEN = os.getenv("HF_TOKEN")
 
-
-def select_device_and_dtype() -> tuple[str, torch.dtype]:
-    """Choose a practical inference device and precision."""
-    if torch.cuda.is_available():
-        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        return "cuda", dtype
-    return "cpu", torch.float32
-
-
-DEVICE, DTYPE = select_device_and_dtype()
+# ZeroGPU allocates the GPU only inside @spaces.GPU functions, so we load the
+# model onto CPU at startup and move it to cuda on the first inference call.
+# fp16 is universally safe; Blackwell also supports bf16.
+DTYPE = torch.float16
 
 
 class LocateAnythingWorker:
     """Loads LocateAnything once and serves repeated Gradio requests."""
 
     def __init__(self, model_id: str) -> None:
-        common_kwargs: dict[str, Any] = {
-            "trust_remote_code": True,
-        }
+        common_kwargs: dict[str, Any] = {"trust_remote_code": True}
         if HF_TOKEN:
             common_kwargs["token"] = HF_TOKEN
 
@@ -38,8 +38,10 @@ class LocateAnythingWorker:
             model_id,
             torch_dtype=DTYPE,
             **common_kwargs,
-        ).to(DEVICE).eval()
+        ).eval()
+        self._on_gpu = False
 
+    @spaces.GPU
     @torch.inference_mode()
     def predict(
         self,
@@ -49,6 +51,13 @@ class LocateAnythingWorker:
         max_new_tokens: int = 2048,
         temperature: float = 0.7,
     ) -> str:
+        # Move the model to the ZeroGPU-allocated GPU once; it stays resident
+        # for the lifetime of this Space container (ZeroGPU keeps the GPU
+        # attached across @spaces.GPU calls within the same warm container).
+        if not self._on_gpu:
+            self.model = self.model.to("cuda")
+            self._on_gpu = True
+
         messages = [
             {
                 "role": "user",
@@ -70,7 +79,7 @@ class LocateAnythingWorker:
             images=images,
             videos=videos,
             return_tensors="pt",
-        ).to(DEVICE)
+        ).to("cuda")
 
         response = self.model.generate(
             pixel_values=inputs["pixel_values"].to(DTYPE),
@@ -92,8 +101,6 @@ class LocateAnythingWorker:
         return str(answer)
 
 
-# The model is loaded once on first use (lazy), so app.py can be imported without
-# triggering a model download. Colab and other callers use get_worker() explicitly.
 _WORKER: LocateAnythingWorker | None = None
 
 
@@ -235,18 +242,54 @@ def run_inference(
     return annotated, prompt, answer
 
 
+EXAMPLES = [
+    ("assets/street_scene.jpg", "Street scene", "Object Detection", "person, car, bicycle", "hybrid"),
+    ("assets/desk_scene.jpg", "Office desk", "Object Detection", "computer, mouse, cup, keyboard, plant", "hybrid"),
+    ("assets/grocery_shelf.jpg", "Grocery shelf", "Phrase Grounding", "the blue and yellow pasta box labeled Whole Wheat Elbows", "hybrid"),
+    ("assets/clothing_store.jpg", "Clothing store", "Object Detection", "dress, shirt, jacket, clothing rack, handbag", "hybrid"),
+]
+
+
+def select_example(evt: gr.SelectData):
+    """When a gallery thumbnail is clicked, load that image + its task/description/mode."""
+    idx = evt.index if isinstance(evt.index, int) else evt.index[0]
+    image_path, _caption, task, description, mode = EXAMPLES[idx]
+    return image_path, task, description, mode
+
+
 def build_demo() -> gr.Blocks:
-    """Build the Gradio Blocks UI. Reused by local run and the Colab demo so the
-    UI stays identical across environments."""
+    """Build the Gradio Blocks UI for the Hugging Face Space."""
     with gr.Blocks(title="Locate Anything Demo") as demo:
         gr.Markdown(
             "# Locate Anything Demo\n"
-            "Upload an image and describe what you want NVIDIA LocateAnything-3B to locate."
+            "Pick an example image, tell NVIDIA LocateAnything-3B what to locate, and run it in the browser."
         )
+        gr.Markdown(
+            "> **Please only run the demo once** &mdash; it uses a shared GPU with a limited daily quota.\n"
+            "> You **can change the Task and the description** to control what the model looks for in the selected example image."
+        )
+
+        # Step 1 — gallery of example images, FULL WIDTH so it's the first thing visitors see.
+        gr.Markdown("**Step 1 — pick an example image**")
+        gallery = gr.Gallery(
+            value=[(path, caption) for path, caption, *_ in EXAMPLES],
+            label="Example images (click one)",
+            show_label=False,
+            columns=4,
+            rows=1,
+            height=280,
+            allow_preview=False,
+            interactive=False,
+        )
+
+        # Step 2 — full-width heading, so the Selected image and Detected result
+        # boxes below it line up on the same horizontal level.
+        gr.Markdown("**Step 2 — adjust the Task and description, then press Locate objects**")
 
         with gr.Row():
             with gr.Column():
-                image_input = gr.Image(type="pil", label="Input image")
+                # The selected image appears here (display-only, no upload).
+                image_input = gr.Image(type="pil", label="Selected image", interactive=False)
                 task_input = gr.Dropdown(
                     choices=[
                         "Object Detection",
@@ -298,6 +341,12 @@ def build_demo() -> gr.Blocks:
                 output_image = gr.Image(type="pil", label="Detected result")
                 generated_prompt = gr.Textbox(label="Prompt sent to model", lines=2)
                 raw_output = gr.Textbox(label="Raw model output", lines=8)
+
+        # Wire the gallery click to populate the image + task + description + mode.
+        gallery.select(
+            fn=select_example,
+            outputs=[image_input, task_input, description_input, mode_input],
+        )
 
         run_button.click(
             fn=run_inference,

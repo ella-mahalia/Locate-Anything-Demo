@@ -1,0 +1,1432 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LocateAnything-3B: A Technical Overview</title>
+<meta name="description" content="A technical overview of NVIDIA's LocateAnything-3B — a vision-language grounding model using Parallel Box Decoding for fast, high-quality visual grounding.">
+<meta property="og:title" content="LocateAnything-3B: A Technical Overview">
+<meta property="og:description" content="How Parallel Box Decoding lets a 3B-parameter vision-language model predict entire bounding boxes in one step instead of four.">
+<meta property="og:type" content="article">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;600;700&family=Geist:wght@300..700&display=swap" rel="stylesheet">
+
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 36 36%22><rect width=%2236%22 height=%2236%22 rx=%228%22 fill=%22%230b0d10%22/><circle cx=%2218%22 cy=%2218%22 r=%225.5%22 fill=%22none%22 stroke=%22%235eead4%22 stroke-width=%222%22/><circle cx=%2218%22 cy=%2218%22 r=%221.6%22 fill=%22%235eead4%22/></svg>">
+
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<a href="#main" class="skip-link">Skip to content</a>
+
+<header class="header" id="site-header">
+  <div class="wrap header-inner">
+    <a href="#top" class="brand">
+      <svg width="28" height="28" viewBox="0 0 36 36" fill="none" aria-hidden="true">
+        <rect x="2" y="2" width="32" height="32" rx="8" fill="none" stroke="currentColor" stroke-width="2"/>
+        <path d="M18 10 L18 26 M10 18 L26 18" stroke="currentColor" stroke-width="1.5" stroke-dasharray="2 3" opacity="0.5"/>
+        <circle cx="18" cy="18" r="5.5" fill="none" stroke="currentColor" stroke-width="2"/>
+        <circle cx="18" cy="18" r="1.6" fill="currentColor"/>
+      </svg>
+      <span class="brand-name">LocateAnything<span>-3B</span></span>
+    </a>
+    <nav class="nav">
+      <ul class="nav-links">
+        <li><a href="#introduction">Intro</a></li>
+        <li><a href="#architecture">Architecture</a></li>
+        <li><a href="#methods">Methods</a></li>
+        <li><a href="#references">References</a></li>
+      </ul>
+      <button class="theme-toggle" data-theme-toggle aria-label="Switch to light mode">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+      </button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+
+  <!-- ============ HERO ============ -->
+  <section class="hero" id="top">
+    <div class="wrap">
+      <div class="hero-eyebrow"><span class="dot"></span> Technical Paper · Vision-Language Models</div>
+      <h1 class="hero-title">LocateAnything<span class="accent">-3B</span>: A Technical Overview</h1>
+      <p class="hero-sub">How a 3-billion-parameter vision-language model breaks the autoregressive bottleneck in visual grounding — predicting entire bounding boxes in one parallel step instead of four sequential ones.</p>
+
+      <div class="hero-stats reveal">
+        <div class="stat-card">
+          <div class="stat-value">12.7</div>
+          <div class="stat-label">Boxes per second (H100) — 2.5× throughput of prior methods</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value">3B</div>
+          <div class="stat-label">Parameters — small enough for real-time, on-device use</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value">6→1</div>
+          <div class="stat-label">Token steps collapsed into a single parallel decode</div>
+        </div>
+      </div>
+
+      <div class="hero-meta">
+        <span class="hero-authors"><strong>Authors:</strong> <span class="author-names">Ishita Sharma, Ella Simeon, Ibrahim Usmani</span></span>
+        <span><strong>Released:</strong> NVIDIA, May 2026</span>
+        <span><strong>Backbone:</strong> Qwen2.5-3B-Instruct + MoonViT</span>
+        <span><strong>Key mechanism:</strong> Parallel Box Decoding (PBD)</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ FIXED TOC (persists across whole page) ============ -->
+  <aside class="toc" id="page-toc">
+    <div class="toc-label">On this page</div>
+    <ul>
+      <li><a href="#introduction">Introduction</a></li>
+      <li><a href="#architecture">Architecture</a></li>
+      <li><a href="#methods">Methods</a></li>
+      <li><a href="#training">Training</a></li>
+      <li><a href="#inference-modes">Inference Modes</a></li>
+      <li><a href="#implementation">Implementation</a></li>
+      <li><a href="#demonstration">Demonstration</a></li>
+      <li><a href="#try-it">Try It Yourself</a></li>
+      <li><a href="#related-work">Related Work</a></li>
+      <li><a href="#limitations">Limitations &amp; Future Work</a></li>
+      <li><a href="#conclusion">Conclusion</a></li>
+      <li><a href="#references">References</a></li>
+    </ul>
+  </aside>
+
+  <!-- ============ INTRODUCTION ============ -->
+  <section id="introduction">
+    <div class="wrap sidebar-layout">
+      <div>
+        <h2 class="section-title">The efficiency problem in visual grounding</h2>
+
+        <div class="prose reveal">
+          <p class="body-copy">Visual grounding is the function of locating a specific object or region within a video or image based on what someone described in natural language, and produces a bounding box that pinpoints specifically where that item or object may be. Unlike traditional object detection, which primarily relies on a fixed set of class labels like "Person," "Car," or "Dog," visual grounding understands free-form, open-vocabulary queries like "the person driving the black car near the left side of the road."<sup><a href="#ref-1" class="mono">[1]</a></sup> This flexibility makes grounding models far more useful for real-world applications where the objects of interest cannot be called out in advance — such as an AI agent that needs to click a specific button on a screen, or an agent that needs to locate various objects based on a description from a user or system.</p>
+
+          <p class="body-copy">Despite how useful visual grounding systems are, existing vision-language models (VLMs) still face a fundamental efficiency problem. They generate their bounding box coordinates one number at a time, requiring four sequential decoding steps to produce a single box.<sup><a href="#ref-2" class="mono">[2]</a></sup> This token-by-token generation process creates a significant latency bottleneck, particularly in dense scenes with many objects, or in real-time applications like robotics and video analysis where speed is critical.</p>
+
+          <p class="body-copy">For this project we explored <strong>LocateAnything-3B</strong> (<a href="https://huggingface.co/nvidia/LocateAnything-3B" target="_blank" rel="noopener">huggingface.co/nvidia/LocateAnything-3B</a>), a vision-language grounding model released by NVIDIA in May 2026.<sup><a href="#ref-3" class="mono">[3]</a></sup> This model was recently released and is currently one of the top trending models on Hugging Face. LocateAnything is a generalist vision-language model — it is not trained to do just one specific thing, like only identifying cats or only scanning license plates, but instead handles a massive variety of everyday objects and concepts. It is built for one core task: point it at an image or video, describe what you are looking for in natural language, and it instantly pinpoints the exact object or region with a bounding box. This model also supports a variety of capabilities in one package, including open-vocabulary object detection, app navigation by AI agents, document analysis, and can assist robots with their perception of the world around them.<sup><a href="#ref-3" class="mono">[3]</a></sup><sup><a href="#ref-4" class="mono">[4]</a></sup></p>
+
+          <p class="body-copy">The gap LocateAnything fills is the tradeoff between decoding speed and localization quality. Rather than accepting slower, sequential decoding as the price of accurate grounding, the model introduces a new decoding mechanism — <strong>Parallel Box Decoding (PBD)</strong> — that predicts an entire bounding box simultaneously, breaking the autoregressive bottleneck while actually improving accuracy on most benchmarks.<sup><a href="#ref-5" class="mono">[5]</a></sup><sup><a href="#ref-6" class="mono">[6]</a></sup></p>
+        </div>
+
+        <figure class="media-block reveal">
+          <img src="assets/images/visual-grounding-intro.png" alt="Diagram showing a visual grounding model: an input photo of skiers with the text query 'a man in a white hat and red jacket cross-country skiing' passes through a neural network and outputs the same photo with a green bounding box around the matching man." loading="lazy">
+          <figcaption><span class="fig-num">Fig. 1</span> Key concept visual: what visual grounding does — a natural-language query goes in, a bounding box comes out.<sup><a href="#ref-7" class="mono">[7]</a></sup></figcaption>
+        </figure>
+
+        <div class="media-full media-md reveal">
+          <div class="wrap-inner">
+            <figure class="media-block">
+              <img src="assets/images/multitask_grounding_v4.gif" alt="Animated illustration of three example use cases side by side: Object Detection on a busy city street scene, GUI Grounding on a mobile app sign-in screen, and OCR / Document Layout analysis on a scanned book page — demonstrating LocateAnything handling one model across multiple grounding tasks." loading="lazy">
+              <figcaption><span class="fig-num">Fig. 2</span> One model, multiple grounding tasks: object detection, GUI grounding, and OCR/document layout.</figcaption>
+            </figure>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ ARCHITECTURE ============ -->
+  <section class="section-alt" id="architecture">
+    <div class="wrap sidebar-layout">
+      <div>
+        <h2 class="section-title">Four components, one pipeline</h2>
+        <p class="lede reveal" style="margin-bottom: var(--space-8);">LocateAnything is built on a standard vision-language model backbone, extended with a specialized output mechanism for efficient box generation.<sup><a href="#ref-3" class="mono">[3]</a></sup></p>
+
+        <div class="component-list reveal">
+          <div class="component-item">
+            <div class="component-num">1</div>
+            <div>
+              <h4>Vision Encoder — MoonViT-SO-400M</h4>
+              <p>The stack starts with MoonViT, a visual transformer encoder adapted from Kimi-VL, which processes the inputted image at its native resolution (up to 2.5K) rather than forcing it into a fixed low-resolution grid. This preserves fine-grained spatial detail that is critical for precise localization, especially for small or densely packed objects.</p>
+            </div>
+          </div>
+          <div class="component-item">
+            <div class="component-num">2</div>
+            <div>
+              <h4>MLP Projector</h4>
+              <p>The visual features produced by MoonViT exist in a different space than the language model's token embeddings. A multi-layer perceptron (MLP) projector bridges this gap, transforming visual tokens into a format the language decoder can process alongside text.</p>
+            </div>
+          </div>
+          <div class="component-item">
+            <div class="component-num">3</div>
+            <div>
+              <h4>Language Decoder — Qwen2.5-3B-Instruct</h4>
+              <p>The projected visual tokens are concatenated with the tokenized natural language query (up to 24K tokens) and fed into Qwen2.5-3B-Instruct, a transformer decoder that handles both language understanding and, in the standard case, next-token generation.</p>
+            </div>
+          </div>
+          <div class="component-item">
+            <div class="component-num">4</div>
+            <div>
+              <h4>Parallel Box Decoding (PBD) Output Head</h4>
+              <p>Instead of relying solely on the decoder's standard token-by-token output layer, LocateAnything adds a specialized output that allows the model to emit an entire bounding box as one atomic unit rather than a sequence of individually predicted tokens. This is the component that most distinguishes LocateAnything from prior generalist grounding VLMs.</p>
+            </div>
+          </div>
+        </div>
+
+        <p class="body-copy reveal" style="margin-top: var(--space-8);">Overall, the model totals 3 billion parameters, making it small enough to be practical for real-time and on-device applications while still matching or exceeding the localization quality of larger specialist models.<sup><a href="#ref-3" class="mono">[3]</a></sup><sup><a href="#ref-5" class="mono">[5]</a></sup></p>
+
+        <figure class="media-block reveal">
+          <img src="assets/images/locateanything_architecture_v5.gif" alt="Animated diagram of the LocateAnything-3B architecture: Input Image + Text Query feeds into MoonViT-SO-400M Vision Encoder, then MLP Projector, then Qwen2.5 Language Decoder, then Parallel Box Decoding Head. Below, a comparison shows Slow Mode (NTP) taking 6 sequential steps versus Fast Mode (PBD) completing the same box in 1 parallel step, for roughly 10x higher throughput." loading="lazy">
+          <figcaption><span class="fig-num">Fig. 3</span> The four-stage pipeline, and the throughput gap between sequential (NTP) and parallel (PBD) box decoding.</figcaption>
+        </figure>
+
+        <figure class="media-block reveal">
+          <img src="assets/images/architecture-output.png" alt="Three-panel diagram: Input (image split into patch tokens plus text query) flows through Model Architecture (MoonViT native-resolution encoder, two-layer MLP projector, Qwen2.5 LLM with multi-token prediction) to produce Output as structured blocks — Semantic Block for text query, Box Block with box start/coordinate/end tokens, repeating Semantic and Box blocks for each detected object, a Negative Block for absent objects, and an End Block." loading="lazy">
+          <figcaption><span class="fig-num">Fig. 4</span> End-to-end view: native-resolution tokenization in, structured block generation out.</figcaption>
+        </figure>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ METHODS ============ -->
+  <section id="methods">
+    <div class="wrap sidebar-layout">
+      <div>
+        <h2 class="section-title">How Parallel Box Decoding works</h2>
+
+        <div class="prose reveal">
+          <p class="body-copy">In standard vision-language models, bounding box coordinates (x1, y1, x2, y2) are generated one number at a time using next-token prediction (NTP) — the same mechanism used to generate ordinary text.<sup><a href="#ref-2" class="mono">[2]</a></sup> Each coordinate is quantized into a unique token, and the model must complete four sequential decoding steps to fully specify a single box. This is similar to writing a word one letter at a time: it may work, but it is slow, and it discards the geometric relationship between the four numbers, since the model treats them as an arbitrary sequence of tokens rather than as part of a single coherent shape.</p>
+
+          <blockquote class="pull-quote">
+            LocateAnything reframes each bounding box as an atomic six-token block rather than four independently generated numbers.
+            <cite>The Main Idea — Parallel Box Decoding<sup><a href="#ref-5" class="mono">[5]</a></sup></cite>
+          </blockquote>
+
+          <p class="body-copy">Each block consists of a <code class="mono" style="background:var(--color-surface-offset); padding: 0.1em 0.4em; border-radius: var(--radius-sm); font-size: 0.9em;">&lt;box&gt;</code> start token, the four quantized coordinate tokens (each normalized to a range of 0–1000), and a <code class="mono" style="background:var(--color-surface-offset); padding: 0.1em 0.4em; border-radius: var(--radius-sm); font-size: 0.9em;">&lt;/box&gt;</code> end token.<sup><a href="#ref-5" class="mono">[5]</a></sup> Instead of predicting these six tokens sequentially, the model predicts the entire block simultaneously in a single parallel decoding step — this is Parallel Box Decoding (PBD).</p>
+        </div>
+
+        <div class="media-full media-md reveal">
+          <div class="wrap-inner">
+            <figure class="media-block">
+              <img src="assets/images/vision_tokenization_v4.gif" alt="Animated MoonViT native-resolution image tokenization diagram: a raw input image is split into a variable-count grid of native-resolution patches, flattened into a token sequence, passed through MoonViT transformer encoder layers, and output as contextualized visual features for the language model — preserving original aspect ratio without resizing distortion." loading="lazy">
+              <figcaption><span class="fig-num">Fig. 5</span> MoonViT tokenizes images at native resolution, avoiding the distortion of forced resizing.</figcaption>
+            </figure>
+          </div>
+        </div>
+
+        <div class="prose reveal">
+          <h3 class="section-title" style="margin-top: var(--space-10);">A different attention mechanism</h3>
+          <p class="body-copy">Predicting six tokens at once requires the model to attend to all of them jointly, rather than only to tokens generated before it. LocateAnything addresses this with a specialized diverse attention mask that combines three attention patterns:<sup><a href="#ref-5" class="mono">[5]</a></sup></p>
+        </div>
+
+        <div class="pattern-grid reveal">
+          <div class="pattern-card">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 12h16M14 6l6 6-6 6"/></svg>
+            <h4>Standard causal attention</h4>
+            <p>Within the ordinary text-generation stream — left-to-right, as in normal language modeling.</p>
+          </div>
+          <div class="pattern-card">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="9" width="6" height="6" rx="1"/><rect x="15" y="9" width="6" height="6" rx="1"/><path d="M9 12h6"/></svg>
+            <h4>Causal attention across blocks</h4>
+            <p>So that later boxes can still condition on earlier ones in the sequence.</p>
+          </div>
+          <div class="pattern-card">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="3"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2 2M16.4 16.4l2 2M5.6 18.4l2-2M16.4 7.6l2-2"/></svg>
+            <h4>Bidirectional attention within a block</h4>
+            <p>All four coordinates and the two boundary tokens see one another, preserving the box's geometric coherence.</p>
+          </div>
+        </div>
+
+        <figure class="media-block reveal">
+          <img src="assets/images/ntp-vs-pbd.png" alt="Comparison diagram: Next Token Prediction generates ref, ship, /ref, box, coordinates one token at a time sequentially. Generic Multi-Token Prediction produces unstructured chunks that mix box boundaries incorrectly. Parallel Box Decoding produces clean box-aligned blocks: ref/ship/ref followed by a complete box token block, repeated cleanly for each object." loading="lazy">
+          <figcaption><span class="fig-num">Fig. 6</span> NTP vs. generic multi-token prediction vs. Parallel Box Decoding — only PBD keeps box tokens cleanly aligned as one unit.</figcaption>
+        </figure>
+
+        <div class="prose reveal">
+          <h3 class="section-title" style="margin-top: var(--space-10);">Dual-formulation training</h3>
+          <p class="body-copy">To ensure the model retains strong language understanding while gaining this new parallel capability, training uses <strong>Dual-Formulation Training</strong> — a dual-objective loss combining a standard token-by-token loss (NTP) and a new block-level parallel loss (MTP), optimized jointly on the same training sequence composed of visual tokens, the query, the NTP target, and the block-level target.<sup><a href="#ref-5" class="mono">[5]</a></sup></p>
+        </div>
+
+        <h3 class="section-title reveal" style="margin-top: var(--space-12);">The payoff</h3>
+        <div class="benchmark reveal">
+          <div class="bench-row">
+            <div class="bench-label"><span>LocateAnything-3B (PBD)</span><span class="val">12.7 BPS</span></div>
+            <div class="bench-track"><div class="bench-fill" data-width="100"></div></div>
+          </div>
+          <div class="bench-row">
+            <div class="bench-label"><span>Rex-Omni</span><span class="val">5.0 BPS</span></div>
+            <div class="bench-track"><div class="bench-fill" data-width="39"></div></div>
+          </div>
+          <div class="bench-row">
+            <div class="bench-label"><span>Qwen3-VL</span><span class="val">1.1 BPS</span></div>
+            <div class="bench-track"><div class="bench-fill" data-width="9"></div></div>
+          </div>
+          <p class="bench-note">Boxes per second (BPS) on an H100 GPU. PBD reaches over 10× the throughput of Qwen3-VL and 2.5× that of Rex-Omni.<sup><a href="#ref-5" class="mono">[5]</a></sup><sup><a href="#ref-6" class="mono">[6]</a></sup></p>
+        </div>
+
+        <div class="prose reveal">
+          <p class="body-copy">Because PBD collapses four sequential decoding steps into one parallel step, LocateAnything achieves up to 2.5× higher throughput than prior approaches. Critically, this speedup does not come at the cost of accuracy: because the bidirectional attention within each block preserves the geometric relationship between the four coordinates, PBD actually improves localization quality on most benchmarks compared to standard autoregressive decoding.<sup><a href="#ref-5" class="mono">[5]</a></sup><sup><a href="#ref-6" class="mono">[6]</a></sup></p>
+        </div>
+
+        <figure class="media-block reveal">
+          <img src="assets/images/hybrid_mode_flow_v3.gif" alt="Animated flowchart of the LocateAnything hybrid decoding mode: a new object query starts, Fast Mode (PBD) predicts the full box in one parallel step, then the model checks if the format is okay and spatial ambiguity is low — if yes, the box is accepted via the fast path; if no, it falls back to Slow Mode (NTP), sequential token-by-token decoding." loading="lazy">
+          <figcaption><span class="fig-num">Fig. 7</span> Hybrid decoding: the model defaults to the fast PBD path, falling back to sequential decoding only when ambiguity is high.</figcaption>
+        </figure>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ TRAINING ============ -->
+  <section class="section-alt" id="training">
+    <div class="wrap sidebar-layout">
+      <div>
+        <h2 class="section-title">Training</h2>
+
+        <h3 class="section-title" style="margin-top: var(--space-8);">Training Strategy</h3>
+        <div class="prose reveal">
+          <p class="body-copy">The training process for LocateAnything-3B consists of four stages. While the last two steps concentrate the model for object identification, visual grounding, and dense scenes, the first two levels establish broad visual-language understanding. This method enables the model to retain a wide range of reasoning skills prior to applying significant bounding-box supervision.</p>
+
+          <p class="body-copy">Both parallel and autoregressive decoding are supported by the model through dual-formulation training. While Multi-Token Prediction (MTP) trains the language model to create bounding box coordinates in parallel, Next-Token Prediction (NTP) maintains the model's capacity to generate tokens sequentially. One model checkpoint may enable Fast, Hybrid, and Slow inference modes since both objectives are trained simultaneously.<sup><a href="#ref-5" class="mono">[5]</a></sup></p>
+
+          <p class="body-copy">The various prediction streams are controlled by a heterogeneous attention mask. Causal attention is used in the prompt, visual context, and NTP output. Block-causal attention between bounding boxes and bidirectional attention inside each box are used in the MTP output. To avoid information leakage between their prediction goals, the NTP and MTP outputs are kept apart.<sup><a href="#ref-5" class="mono">[5]</a></sup></p>
+        </div>
+
+        <h4 class="subsection-title">Four-Stage Training Pipeline</h4>
+        <div class="table-wrap reveal">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Stage</th>
+                <th>Main Objective</th>
+                <th>Training Data</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>1</td>
+                <td>Align visual features with the language decoder</td>
+                <td>Image-caption data</td>
+              </tr>
+              <tr>
+                <td>2</td>
+                <td>Develop broad multimodal understanding</td>
+                <td>VQA, OCR, charts, science, mathematics, code, counting, and instruction data</td>
+              </tr>
+              <tr>
+                <td>3</td>
+                <td>Specialize in detection and grounding</td>
+                <td>Object detection, GUI grounding, text localization, document analysis, and point localization</td>
+              </tr>
+              <tr>
+                <td>4</td>
+                <td>Improve performance in dense scenes</td>
+                <td>Previous training data combined with dense-object datasets</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="prose reveal">
+          <p class="body-copy">To align the MoonViT visual characteristics with the Qwen2.5 language decoder, only the MLP projector is trained during Stage 1. Stage 2 involves training the full model on a wide range of multimodal tasks. Stage 3 presents detection and grounding supervision, while Stage 4 leverages dense-scene datasets like MOT20Det and SKU110K to concentrate on tiny, overlapping, and visually comparable objects.<sup><a href="#ref-5" class="mono">[5]</a></sup></p>
+        </div>
+
+        <h3 class="section-title" style="margin-top: var(--space-12);">Training Data</h3>
+        <div class="prose reveal">
+          <p class="body-copy">More than 12 million photos, 138 million natural language searches, and 785 million bounding boxes may be found in LocateAnything-Data. The dataset's emphasis on complex scenes, where a single image may include several labelled items, is reflected in the huge number of bounding boxes relative to images.<sup><a href="#ref-3" class="mono">[3]</a></sup><sup><a href="#ref-5" class="mono">[5]</a></sup></p>
+
+          <p class="body-copy">General object detection, referring-expression comprehension, GUI grounding, text localization, document and scene-layout grounding, and point-based localization are all included in the dataset. Due to its diversity, the model may function in a range of visually complex contexts, including natural sights, papers, application interfaces, driving situations, and robotics.</p>
+
+          <p class="body-copy">LocateAnything employs online stream packing to merge the training samples into more effective sequences since they vary widely in length and complexity. MagiAttention prevents unrelated packed samples from attending to each other while controlling the combination of causal, block-causal, and bidirectional attention.<sup><a href="#ref-5" class="mono">[5]</a></sup></p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ INFERENCE MODES ============ -->
+  <section class="section-alt" id="inference-modes">
+    <div class="wrap sidebar-layout">
+      <div>
+        <h2 class="section-title">Inference Modes</h2>
+        <div class="prose reveal">
+          <p class="body-copy">Three inference modes are offered by LocateAnything-3B:</p>
+        </div>
+        <div class="mode-list reveal">
+          <div class="mode-card">
+            <div class="mode-name">Fast Mode</div>
+            <p>Speedily generates bounding-box coordinates by using pure parallel decoding. It is designed for scenarios when processing speed is of utmost importance.</p>
+          </div>
+          <div class="mode-card">
+            <div class="mode-name">Hybrid Mode</div>
+            <p>The default option. It strikes a compromise between speed and localisation quality by combining sequential generation across distinct boxes with concurrent prediction inside each bounding box.</p>
+          </div>
+          <div class="mode-card">
+            <div class="mode-name">Slow Mode</div>
+            <p>Conventional autoregressive decoding is used. Although it is slower than the other modes, it is compatible with conventional vision-language model production since the output is created token by token.<sup><a href="#ref-5" class="mono">[5]</a></sup></p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ IMPLEMENTATION ============ -->
+  <section id="implementation">
+    <div class="wrap sidebar-layout">
+      <div>
+        <h2 class="section-title">Implementation</h2>
+        <div class="prose reveal">
+          <p class="body-copy">The project makes use of a Gradio interface for interactive testing and the nvidia/LocateAnything-3B model from Hugging Face.<sup><a href="#ref-9" class="mono">[9]</a></sup><sup><a href="#ref-10" class="mono">[10]</a></sup> Users choose an inference mode, pick a localization task, submit a picture, and respond to a natural language inquiry. After the model processes the picture and prompt, the produced coordinates appear on the output image as bounding boxes or points.</p>
+
+          <p class="body-copy">There are many task options available in the interface:</p>
+        </div>
+        <div class="task-list reveal">
+          <div class="task-item">
+            <span class="task-tag">Object Detection</span>
+            <p>Several item types may be found in a picture using object detection.</p>
+          </div>
+          <div class="task-item">
+            <span class="task-tag">Phrase Grounding</span>
+            <p>Finds a particular object that the user has described, such as "the person wearing a red shirt."</p>
+          </div>
+          <div class="task-item">
+            <span class="task-tag">OCR</span>
+            <p>Locates and recognizes text that is visible in an image.</p>
+          </div>
+          <div class="task-item">
+            <span class="task-tag">GUI Grounding</span>
+            <p>Locates interface components in screenshots, including buttons, icons, and menus.</p>
+          </div>
+          <div class="task-item">
+            <span class="task-tag">Pointing</span>
+            <p>When identifying a single place is sufficient and a full bounding box is not required, pointing returns a single coordinate.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ DEMONSTRATION (includes Experiments & Results) ============ -->
+  <section class="section-alt" id="demonstration">
+    <div class="wrap sidebar-layout">
+      <div>
+        <h2 class="section-title">Demonstration</h2>
+        <div class="prose reveal">
+          <p class="body-copy">Sample photos will be used to showcase the Gradio program during our presentation. The ability of LocateAnything-3B to identify objects, text, interface elements, and other indicated locations will be demonstrated through various prompts, task choices, and inference modes.</p>
+          <p class="body-copy">The experiments below were run in a Jupyter notebook on the NJIT Wulver GPU cluster and move from ordinary scenes to more difficult, crowded environments so that both the model's strengths and its limitations can be observed. Every test follows the same procedure: load and resize the image, send a grounding phrase or list of categories, parse the model's normalised coordinates (0&ndash;1000), draw the predicted boxes, save the annotated result, and record false positives, missed items, and accurate detections.</p>
+        </div>
+
+        <dl class="demo-env reveal">
+          <dt class="demo-env-title">Computing Environment</dt>
+          <div class="demo-env-grid">
+            <dt>Platform</dt>
+            <dd>NJIT Open OnDemand &middot; Wulver cluster</dd>
+            <dt>GPU</dt>
+            <dd>NVIDIA A100 MIG partition (~9.75 GB available)</dd>
+            <dt>Environment</dt>
+            <dd>Conda <code class="mono">locateanything</code> &middot; PyTorch + CUDA</dd>
+            <dt>Checkpoint</dt>
+            <dd><code class="mono">nvidia/LocateAnything-3B</code> (loaded once, reused)</dd>
+          </div>
+        </dl>
+
+        <h3 class="demo-subsection" id="demo-experiments">Experiments</h3>
+        <!-- ===== Test 1 ===== -->
+        <article class="experiment-card reveal" id="test-1">
+          <header class="experiment-header">
+            <span class="experiment-num">01</span>
+            <div>
+              <h3 class="experiment-title">Street-Scene Object Detection</h3>
+              <p class="experiment-purpose">In an outdoor setting with items at various sizes and distances, this test assesses typical open-vocabulary detection.</p>
+            </div>
+          </header>
+          <div class="experiment-meta">
+            <div class="meta-row">
+              <span class="meta-label">Query</span>
+              <div class="meta-content">
+                <div class="query-pills">
+                  <span class="query-pill">person</span>
+                  <span class="query-pill">car</span>
+                  <span class="query-pill">bicycle</span>
+                </div>
+              </div>
+            </div>
+            <div class="meta-row">
+              <span class="meta-label">Challenge</span>
+              <div class="meta-content"><p>Large foreground items should be easier to find than smaller, partially visible, or near-image-boundary objects.</p></div>
+            </div>
+          </div>
+          <div class="image-pair">
+            <figure class="media-block">
+              <img src="assets/images/demo/demo_cell_009_out_00.png" alt="Outdoor street scene used as the input image for Test 1, showing pedestrians, parked cars, and a bicycle along a sidewalk." loading="lazy">
+              <figcaption><span class="pair-label">Input</span> &middot; 640&times;640 street scene</figcaption>
+            </figure>
+            <figure class="media-block">
+              <img src="assets/images/demo/demo_cell_011_out_00.png" alt="The same street scene annotated with red bounding boxes around detected people, cars, and a bicycle." loading="lazy">
+              <figcaption><span class="pair-label">Annotated</span> &middot; 10 boxes drawn across person, car, and bicycle</figcaption>
+            </figure>
+          </div>
+          <div class="experiment-result">
+            <h4 class="result-title">Results &amp; Observations</h4>
+            <p>The model produced <strong>11 bounding boxes</strong> across all three requested categories. People, automobiles, and bicycles were among the output, demonstrating that the model could react to many category labels in a single request.</p>
+            <p>With a reported rate of around <strong>0.42 boxes per second</strong>, the recorded generation time was roughly <strong>26.20 seconds</strong>. Some predictions sat close to the margins of the picture, so the annotated output should be visually examined for boxes that could be missing or abnormally big.</p>
+            <p>Because the specified categories differ visually from one another, this test offers a helpful baseline.</p>
+          </div>
+        </article>
+        <!-- ===== Test 2 ===== -->
+        <article class="experiment-card reveal" id="test-2">
+          <header class="experiment-header">
+            <span class="experiment-num">02</span>
+            <div>
+              <h3 class="experiment-title">Office and Desk Object Detection</h3>
+              <p class="experiment-purpose">This test assesses the model in an interior workplace scenario with common objects that could overlap or appear at varying sizes.</p>
+            </div>
+          </header>
+          <div class="experiment-meta">
+            <div class="meta-row">
+              <span class="meta-label">Query</span>
+              <div class="meta-content">
+                <div class="query-pills">
+                  <span class="query-pill">computer</span>
+                  <span class="query-pill">mouse</span>
+                  <span class="query-pill">cup</span>
+                  <span class="query-pill">keyboard</span>
+                  <span class="query-pill">plant</span>
+                </div>
+              </div>
+            </div>
+            <div class="meta-row">
+              <span class="meta-label">Challenge</span>
+              <div class="meta-content"><p>Little items like a mouse or cup might be harder to find than a large computer, and several plants may appear at varying sizes and locations.</p></div>
+            </div>
+          </div>
+          <div class="image-pair">
+            <figure class="media-block">
+              <img src="assets/images/demo/demo_cell_015_out_00.png" alt="Office desk scene used as the input image for Test 2, showing a computer monitor, keyboard, mouse, cup, and plants." loading="lazy">
+              <figcaption><span class="pair-label">Input</span> &middot; 800&times;800 office/desk scene</figcaption>
+            </figure>
+            <figure class="media-block">
+              <img src="assets/images/demo/demo_cell_016_out_02.png" alt="The same office desk annotated with red bounding boxes around the computer, mouse, cup, keyboard, and plants." loading="lazy">
+              <figcaption><span class="pair-label">Annotated</span> &middot; 7 boxes drawn despite a CUDA memory warning</figcaption>
+            </figure>
+          </div>
+          <div class="experiment-result">
+            <h4 class="result-title">Results &amp; Observations</h4>
+            <p>The office-scene test generated <strong>7 bounding boxes</strong>. One computer, one mouse, one cup, one keyboard, and several plant forecasts were among the output.</p>
+            <p>The run reported around <strong>3.28 boxes per second</strong> and finished in about <strong>2.13 seconds</strong>. Despite the appearance of a CUDA memory-allocation warning, the annotation was stored as <code class="mono">desk_detection_result.jpg</code> and the inference still finished.</p>
+            <p>This image generated a cleaner output and fewer predictions than the street scene. The model performed best on large, clearly visible objects, while smaller or partially obscured things required deeper visual assessment.</p>
+          </div>
+        </article>
+        <!-- ===== Test 3 ===== -->
+        <article class="experiment-card reveal" id="test-3">
+          <header class="experiment-header">
+            <span class="experiment-num">03</span>
+            <div>
+              <h3 class="experiment-title">Dense Grocery-Shelf Detection</h3>
+              <p class="experiment-purpose">This test assesses detection in a crowded shop environment with several little, aesthetically similar objects.</p>
+            </div>
+          </header>
+          <div class="experiment-meta">
+            <div class="meta-row">
+              <span class="meta-label">Query</span>
+              <div class="meta-content">
+                <div class="query-pills">
+                  <span class="query-pill">pasta box</span>
+                </div>
+              </div>
+            </div>
+            <div class="meta-row">
+              <span class="meta-label">Challenge</span>
+              <div class="meta-content"><p>Repeated rectangular packaging, similar colours, tiny labels, overlapping goods, and closely spaced items fill the shelf, making it harder to distinguish authentic pasta from visually identical soup, broth, and other food packaging. The image is shrunk to consume less GPU memory and cropped to remove the bottom watermark.</p></div>
+            </div>
+          </div>
+          <div class="image-pair">
+            <figure class="media-block">
+              <img src="assets/images/demo/demo_cell_019_out_00.png" alt="Dense grocery shelf used as the input image for Test 3, packed with many similarly shaped boxes and cartons." loading="lazy">
+              <figcaption><span class="pair-label">Input</span> &middot; 512&times;331 cropped grocery shelf</figcaption>
+            </figure>
+            <figure class="media-block">
+              <img src="assets/images/demo/demo_cell_021_out_00.png" alt="The same grocery shelf annotated with red bounding boxes around items the model labelled as pasta boxes." loading="lazy">
+              <figcaption><span class="pair-label">Annotated</span> &middot; 20 parsed boxes (model reported 21)</figcaption>
+            </figure>
+          </div>
+          <div class="experiment-result">
+            <h4 class="result-title">Results &amp; Observations</h4>
+            <p>The parser showed <strong>20 complete predictions</strong> from the produced text, although the model statistics indicated <strong>21 boxes</strong>. One last prediction may not have been properly reflected in the parsed result since the output exceeded the <code class="mono">max_new_tokens=128</code> limit.</p>
+            <p>Particularly on the left side of the shelf, the model detected a number of packaged and cup-shaped pasta items. However, the crowded scene also produced classification mistakes:</p>
+            <ul>
+              <li>A few boxed goods, such as soup or broth, were labelled as pasta boxes.</li>
+              <li>On the lower-right shelf, a number of real pasta items were overlooked.</li>
+              <li>The wide category query did not pick the displayed Whole Wheat Elbows box.</li>
+              <li>Similar packaging resulted in missed detections as well as false positives.</li>
+            </ul>
+            <p>Although dense layouts and similar packing make exact category separation more challenging, this experiment shows that LocateAnything can recognize repeated items in a congested situation.</p>
+          </div>
+        </article>
+        <!-- ===== Test 4 ===== -->
+        <article class="experiment-card reveal" id="test-4">
+          <header class="experiment-header">
+            <span class="experiment-num">04</span>
+            <div>
+              <h3 class="experiment-title">Broad Phrase Grounding</h3>
+              <p class="experiment-purpose">In this test, the objective is to locate a single object from a natural-language description instead of identifying every object in a category.</p>
+            </div>
+          </header>
+          <div class="experiment-meta">
+            <div class="meta-row">
+              <span class="meta-label">Prompt</span>
+              <div class="meta-content"><span class="query-phrase">a pasta box on the bottom shelf</span></div>
+            </div>
+            <div class="meta-row">
+              <span class="meta-label">Setup</span>
+              <div class="meta-content"><p>To exclude irrelevant goods and lessen the quantity of visual data the model processes, the picture is cropped to the lower shelf.</p></div>
+            </div>
+          </div>
+          <div class="image-pair">
+            <figure class="media-block">
+              <img src="assets/images/demo/demo_cell_024_out_00.png" alt="Lower shelf of the grocery image cropped to a thin horizontal strip for Test 4." loading="lazy">
+              <figcaption><span class="pair-label">Input</span> &middot; 512&times;124 lower-shelf crop</figcaption>
+            </figure>
+            <figure class="media-block">
+              <img src="assets/images/demo/demo_cell_026_out_00.png" alt="The cropped lower shelf with a single red bounding box drawn around a neighbouring chili product rather than the intended pasta box." loading="lazy">
+              <figcaption><span class="pair-label">Annotated</span> &middot; 1 box &mdash; selected the wrong item</figcaption>
+            </figure>
+          </div>
+          <div class="experiment-result">
+            <h4 class="result-title">Results &amp; Observations</h4>
+            <p>Instead of choosing the specified Whole Wheat Elbows pasta box, the model chose a neighbouring chilli product and returned <strong>one bounding box</strong>.</p>
+            <p>Although the shelf position was included in the description, there was insufficient information to set the target apart from other rectangular packages. This outcome shows that a good bounding box does not necessarily imply proper grounding of the intended item.</p>
+          </div>
+        </article>
+        <!-- ===== Test 5 ===== -->
+        <article class="experiment-card reveal" id="test-5">
+          <header class="experiment-header">
+            <span class="experiment-num">05</span>
+            <div>
+              <h3 class="experiment-title">Refined Phrase Grounding</h3>
+              <p class="experiment-purpose">This test looks at whether grounding accuracy is improved by a more precise description and a tighter crop.</p>
+            </div>
+          </header>
+          <div class="experiment-meta">
+            <div class="meta-row">
+              <span class="meta-label">Refined Prompt</span>
+              <div class="meta-content"><span class="query-phrase">the blue and yellow pasta box labeled Whole Wheat Elbows</span></div>
+            </div>
+            <div class="meta-row">
+              <span class="meta-label">Improvements</span>
+              <div class="meta-content">
+                <p>The updated prompt adds the colours of the packaging, the kind of product, visible label writing, and a smaller visual area with fewer distracting items. The aim is less unclear due to the additional language and visual indications.</p>
+              </div>
+            </div>
+          </div>
+          <div class="image-pair">
+            <figure class="media-block">
+              <img src="assets/images/demo/demo_cell_029_out_00.png" alt="Tight crop of the grocery shelf focused on the Whole Wheat Elbows pasta box region for Test 5." loading="lazy">
+              <figcaption><span class="pair-label">Input</span> &middot; 351&times;230 tight crop</figcaption>
+            </figure>
+            <figure class="media-block">
+              <img src="assets/images/demo/demo_cell_031_out_00.png" alt="The tight crop annotated with a single red bounding box around the correct Whole Wheat Elbows pasta box." loading="lazy">
+              <figcaption><span class="pair-label">Annotated</span> &middot; 1 box on the correct target</figcaption>
+            </figure>
+          </div>
+          <div class="experiment-result">
+            <h4 class="result-title">Results &amp; Observations</h4>
+            <p>The improved test returned <strong>one bounding box</strong> surrounding the specified Whole Wheat Elbows product region.</p>
+            <p>The more specific language and narrower crop yielded a more focused outcome than the general request. This implies that visual grounding can be enhanced when the trigger incorporates unique colours, language, and object characteristics, and when irrelevant elements of the scene are eliminated.</p>
+          </div>
+        </article>
+        <!-- ===== Test 6 ===== -->
+        <article class="experiment-card reveal" id="test-6">
+          <header class="experiment-header">
+            <span class="experiment-num">06</span>
+            <div>
+              <h3 class="experiment-title">Clothing-Store Scene &amp; Query Refinement</h3>
+              <p class="experiment-purpose">This test assesses the model in a different packed store setting with apparel and accessories, and looks at whether detection quality can be improved by altering the item categories.</p>
+            </div>
+          </header>
+
+          <h4 class="subsection-title" style="margin-top: var(--space-6);">Initial Query</h4>
+          <div class="experiment-meta">
+            <div class="meta-row">
+              <span class="meta-label">Prompt</span>
+              <div class="meta-content">
+                <div class="query-pills">
+                  <span class="query-pill">clothing</span>
+                  <span class="query-pill">glasses</span>
+                  <span class="query-pill">jewelry</span>
+                </div>
+              </div>
+            </div>
+            <div class="meta-row">
+              <span class="meta-label">Note</span>
+              <div class="meta-content"><p>The code passes this as <strong>one unified description</strong> instead of producing distinct category-by-category results for clothes, glasses, and jewellery, so regions match the whole phrase.</p></div>
+            </div>
+          </div>
+          <div class="image-pair">
+            <figure class="media-block">
+              <img src="assets/images/demo/demo_cell_034_out_00.png" alt="Clothing store scene used as the input image for Test 6, showing racks of clothing, accessories, and display areas." loading="lazy">
+              <figcaption><span class="pair-label">Input</span> &middot; 512&times;300 clothing-store crop</figcaption>
+            </figure>
+            <figure class="media-block">
+              <img src="assets/images/demo/demo_cell_036_out_00.png" alt="The clothing store annotated with red bounding boxes around the items detected using the initial clothing, glasses, jewelry query." loading="lazy">
+              <figcaption><span class="pair-label">Annotated</span> &middot; 8 boxes &mdash; mostly large clothing</figcaption>
+            </figure>
+          </div>
+          <div class="experiment-result">
+            <h4 class="result-title">Initial Results</h4>
+            <p>Throughout the store, the model identified a number of apparel products and racks. The majority of forecasts concentrated on large, eye-catching clothing. However, because jewellery and spectacles were tiny, hard to identify, and not readily apparent at the enlarged image quality, no boxes containing those items were returned.</p>
+            <p>Several of the clothes boxes did not designate specific outfits; instead, they spanned whole rack portions or overlapped.</p>
+          </div>
+
+          <h4 class="subsection-title" style="margin-top: var(--space-10);">Refined Query</h4>
+          <div class="experiment-meta">
+            <div class="meta-row">
+              <span class="meta-label">Prompt</span>
+              <div class="meta-content">
+                <div class="query-pills">
+                  <span class="query-pill">dress</span>
+                  <span class="query-pill">shirt</span>
+                  <span class="query-pill">jacket</span>
+                  <span class="query-pill">clothing rack</span>
+                  <span class="query-pill">handbag</span>
+                </div>
+              </div>
+            </div>
+            <div class="meta-row">
+              <span class="meta-label">Change</span>
+              <div class="meta-content"><p>Objects that were easier to see in the picture were added to the query, replacing the small, ambiguous accessories with larger, visually distinct categories.</p></div>
+            </div>
+          </div>
+          <div class="image-pair">
+            <figure class="media-block">
+              <img src="assets/images/demo/demo_cell_034_out_00.png" alt="The same clothing store scene reused as input for the refined Test 6 query." loading="lazy">
+              <figcaption><span class="pair-label">Input</span> &middot; same 512&times;300 source crop</figcaption>
+            </figure>
+            <figure class="media-block">
+              <img src="assets/images/demo/demo_cell_038_out_02.png" alt="The clothing store annotated with red bounding boxes around dresses, shirts, jackets, clothing racks, and handbags detected using the refined query." loading="lazy">
+              <figcaption><span class="pair-label">Annotated</span> &middot; 8 more specific boxes</figcaption>
+            </figure>
+          </div>
+          <div class="experiment-result">
+            <h4 class="result-title">Refined Results &amp; Observation</h4>
+            <p>Results from the enhanced query were more precise and insightful. The model recognised various areas with hanging garments, a shirt, a jacket, purses, and clothes racks. Smaller spaces for clothing and handbags were found on the left and center of the picture, while the enormous garment rack on the right was plainly visible.</p>
+            <p>Particularly in the congested left half of the store, several bounding boxes still comprised groupings of products or overlapped.</p>
+            <p>Since the chosen categories were larger, more visually distinct, and plainly visible in the image, the enhanced query performed better. The original test revealed that small accessories and wide categories can be challenging to identify, while the improved test indicated that using image-appropriate and specific item labels can increase recognition quality.</p>
+            <p>Overall, Test 6 demonstrates that LocateAnything-3B is sensitive to both prompt selection and scene complexity. More precise, comprehensive, and practical bounding-box predictions were obtained by fine-tuning the required categories.</p>
+          </div>
+        </article>
+        <h3 class="demo-subsection" id="results-summary">Results Summary</h3>
+        <div class="table-wrap results-summary reveal">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Test</th>
+                <th>Scene &amp; Task</th>
+                <th>Prompt</th>
+                <th>Main Result</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>1</td>
+                <td>Street-scene object detection</td>
+                <td><code class="mono">person</code>, <code class="mono">car</code>, <code class="mono">bicycle</code></td>
+                <td>Detected 11 objects across all three requested categories</td>
+              </tr>
+              <tr>
+                <td>2</td>
+                <td>Office-scene object detection</td>
+                <td><code class="mono">computer</code>, <code class="mono">mouse</code>, <code class="mono">cup</code>, <code class="mono">keyboard</code>, <code class="mono">plant</code></td>
+                <td>Detected 7 objects; inference completed despite a CUDA memory warning</td>
+              </tr>
+              <tr>
+                <td>3</td>
+                <td>Dense grocery-shelf detection</td>
+                <td><code class="mono">pasta box</code></td>
+                <td>Parsed 20 boxes, but produced false positives and missed several actual pasta products</td>
+              </tr>
+              <tr>
+                <td>4</td>
+                <td>Broad phrase grounding</td>
+                <td><code class="mono">a pasta box on the bottom shelf</code></td>
+                <td>Returned one box, but selected a nearby chili product instead of the intended pasta box</td>
+              </tr>
+              <tr>
+                <td>5</td>
+                <td>Refined phrase grounding</td>
+                <td><code class="mono">the blue and yellow pasta box labeled Whole Wheat Elbows</code></td>
+                <td>A tighter crop and more detailed prompt produced a more accurate, targeted prediction</td>
+              </tr>
+              <tr>
+                <td>6</td>
+                <td>Clothing-store detection &amp; query refinement</td>
+                <td>Initial: <code class="mono">clothing</code>, <code class="mono">glasses</code>, <code class="mono">jewelry</code>; Refined: <code class="mono">dress</code>, <code class="mono">shirt</code>, <code class="mono">jacket</code>, <code class="mono">clothing rack</code>, <code class="mono">handbag</code></td>
+                <td>The initial query mainly detected clothing, while the refined query produced more specific and useful detections</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 class="demo-subsection" id="gpu-memory">GPU-Memory Considerations</h3>
+        <div class="prose reveal">
+          <p class="body-copy">The Wulver session provided approximately 9.75 GB of GPU memory. Dense scenes and repeated inference calls placed significant pressure on this allocation.</p>
+          <p class="body-copy">During experimentation, a broader grocery query caused a CUDA out-of-memory error after the earlier dense prediction had already consumed most of the available memory. The final workflow reduced memory use by:</p>
+        </div>
+        <ul class="demo-bullets reveal">
+          <li>Loading the model only once</li>
+          <li>Resizing large images</li>
+          <li>Cropping images to the relevant region</li>
+          <li>Using focused categories or phrases</li>
+          <li>Limiting <code class="mono">max_new_tokens</code></li>
+          <li>Restarting the kernel when GPU memory remained occupied</li>
+        </ul>
+        <div class="prose reveal">
+          <p class="body-copy">The out-of-memory event was a hardware-resource limitation and was not treated as a completed model result.</p>
+        </div>
+
+        <h3 class="demo-subsection" id="main-findings">Main Findings</h3>
+        <ol class="findings-list reveal">
+          <li class="finding-item">
+            <p><strong>Clear categories performed well in everyday scenes.</strong> The street and office photographs yielded reasonable multi-object detections.</p>
+          </li>
+          <li class="finding-item">
+            <p><strong>Dense situations contributed to category confusion.</strong> Similar supermarket containers led to false positives and missing pasta goods.</p>
+          </li>
+          <li class="finding-item">
+            <p><strong>Prompt specificity mattered.</strong> The particular color-and-label prompt gave a more focused result, but the general pasta-box phrase picked the incorrect object.</p>
+          </li>
+          <li class="finding-item">
+            <p><strong>Image cropping was helpful.</strong> Removing irrelevant areas decreased GPU memory use and ambiguity.</p>
+          </li>
+          <li class="finding-item">
+            <p><strong>Improved detection was achieved by using categories that are readily apparent.</strong> In the context of clothes stores, predictions were more accurate when conspicuous items like shirts, coats, clothing racks, and purses were substituted for tiny or ambiguous accessories.</p>
+          </li>
+        </ol>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ TRY IT YOURSELF (embedded Gradio app) ============ -->
+  <section id="try-it">
+    <div class="wrap sidebar-layout">
+      <div>
+        <h2 class="section-title">Try It Yourself</h2>
+        <div class="prose reveal">
+          <p class="body-copy">The interactive demo below is the same Gradio app from <code class="mono">app.py</code> in the project repository, hosted on a Hugging Face Space backed by ZeroGPU (NVIDIA RTX Pro 6000 Blackwell). Choose an image, choose a grounding task, describe what to locate, pick an inference mode, and run LocateAnything-3B directly in the browser &mdash; no local setup required.</p>
+          <p class="body-copy">Tasks mirror the experiments above. Pick one in the demo's <strong>Task</strong> dropdown:</p>
+          <ul class="task-list">
+            <li><strong>Object Detection</strong> &mdash; comma-separated category list (e.g. <code class="mono">person, car, bus</code>).</li>
+            <li><strong>Phrase Grounding</strong> &mdash; natural-language description (e.g. <em>the person wearing a red shirt</em>).</li>
+            <li><strong>OCR / Text Detection</strong> &mdash; needs no description.</li>
+            <li><strong>GUI Grounding</strong> &mdash; targets an interface element.</li>
+            <li><strong>Pointing</strong> &mdash; returns a single coordinate.</li>
+          </ul>
+          <p class="body-copy"><strong>Inference modes:</strong> <code class="mono">hybrid</code> (default) balances speed and quality; <code class="mono">fast</code> uses pure parallel decoding; <code class="mono">slow</code> falls back to sequential autoregressive decoding.</p>
+        </div>
+
+        <p class="embed-note">
+          <svg class="embed-note-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>
+          <span><strong>Please only run the demo once.</strong> This demo runs on shared ZeroGPU infrastructure with a limited daily GPU-minute quota &mdash; the quota can get exhausted and the demo will stop working for everyone until it resets. The first request after the Space wakes up takes ~30&ndash;60 s while the 3B checkpoint loads onto the GPU. If the demo doesn't run, try refreshing the page; if it is still not working the daily ZeroGPU runs limit has most likely been reached, please try again later.</span>
+        </p>
+
+        <p class="demo-direct-link">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+          <span>Trouble with the embedded demo above? <a href="https://cyberfrost7-locate-anything-demo.hf.space/" target="_blank" rel="noopener">Open the live demo directly on Hugging Face Spaces &nearr;</a></span>
+        </p>
+
+        <div class="gradio-embed reveal" id="gradio-embed">
+          <iframe
+            id="gradio-frame"
+            title="Locate Anything Gradio demo"
+            loading="lazy"
+            allow="autoplay; camera; microphone; clipboard-write"
+            referrerpolicy="no-referrer">
+          </iframe>
+          <div class="embed-loading" id="embed-loading">
+            <div>
+              <div class="spinner" aria-hidden="true"></div>
+              <div class="loading-title">Loading the Gradio demo&hellip;</div>
+              <div class="loading-sub">The first request wakes the Space and loads the 3B checkpoint onto the GPU, which can take 30&ndash;60 seconds.</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Fallback shown when GRADIO_LIVE_URL is empty or the iframe fails to load -->
+        <div class="embed-fallback" id="embed-fallback" hidden>
+          <div class="fallback-icon" aria-hidden="true">
+            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+          </div>
+          <h3 class="fallback-title">The demo Space is asleep</h3>
+          <p class="fallback-desc">The Hugging Face Space goes to sleep when it hasn't been used for a while. To wake it up, click the button below to open the Space &mdash; once it finishes loading, come back here and <strong>refresh this page</strong> to activate the embedded demo.</p>
+          <a class="fallback-cta" href="https://cyberfrost7-locate-anything-demo.hf.space" target="_blank" rel="noopener">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+            Open the Locate Anything Space
+          </a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ RELATED WORK ============ -->
+  <section id="related-work">
+    <div class="wrap sidebar-layout">
+      <div>
+        <h2 class="section-title">Related Work</h2>
+        <div class="prose reveal">
+          <p class="body-copy">Vision-language models grounded in open vocabulary have advanced fast, from dual-encoder cross-attention models to unified sequence-to-sequence models. We provide a comparison between <strong>LocateAnything-3B</strong> and relevant architectures below.</p>
+          <dl class="related-models">
+            <dt>Grounding DINO</dt>
+            <dd>Dual image-text encoders combined with cross-attention feature maps to align text tokens and image regions. Despite being very good at phrase grounding, coordinate generation requires computing cross-attention matrices, resulting in inference latency issues, especially in dense images.</dd>
+            <dt>Florence-2</dt>
+            <dd>Unified sequence-to-sequence vision model covering grounding, OCR, and segmentation through text prompts. Nonetheless, Florence-2 needs sequential token generation for spatial coordinates, creating latency issues when predicting multiple objects.</dd>
+            <dt>Rex-Omni</dt>
+            <dd>Omni-modal visual perception system designed specifically for fine-grained object localization and GUI parsing. Although it performs very well on complex UI arrangements, it has a very high computational cost and uses more VRAM.</dd>
+            <dt>Qwen2.5-VL</dt>
+            <dd>Uses a powerful multimodal LLM backbone for complex spatial reasoning and zero-shot detection. Nonetheless, autoregressive coordinate prediction (token by token) leads to geometrical coherence and slow decoding speed issues.</dd>
+            <dt>LocateAnything-3B <span class="ours-tag">&starf;</span></dt>
+            <dd>Combines a MoonViT-SO-400M image encoder with a Qwen2.5-3B-Instruct architecture, where the autoregressive process is substituted with <strong>Parallel Box Decoding (PBD)</strong>. Using one pass for simultaneous prediction of coordinate patches (Fast Mode / MTP), it reaches up to <strong>2.5&times;</strong> faster inference compared to autoregressive methods while keeping the hybrid mode option (Slow Mode / NTP).</dd>
+          </dl>
+        </div>
+        <h3 class="demo-subsection" id="related-comparison">Summary Comparison Matrix</h3>
+        <div class="table-wrap comparison-wrap reveal">
+          <table class="data-table comparison-matrix">
+            <thead>
+              <tr>
+                <th>Model</th>
+                <th>Architecture Paradigm</th>
+                <th>Coordinate Generation</th>
+                <th>Primary Tasks</th>
+                <th>VRAM Footprint</th>
+                <th>Speed vs. Accuracy Trade-off</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Grounding DINO</td>
+                <td>Dual-Encoder + Cross-Attention</td>
+                <td>Cross-Attention Feature Map</td>
+                <td>Phrase Grounding, Object Detection</td>
+                <td><code class="mono">~6&ndash;8 GB</code></td>
+                <td>High grounding precision; slow in multi-object scenes.</td>
+              </tr>
+              <tr>
+                <td>Florence-2</td>
+                <td>Unified Seq2Seq Transformer</td>
+                <td>Autoregressive Token Generation</td>
+                <td>Grounding, OCR, Segmentation</td>
+                <td><code class="mono">~4&ndash;8 GB</code></td>
+                <td>High task versatility; latency bottlenecks in box prediction.</td>
+              </tr>
+              <tr>
+                <td>Rex-Omni</td>
+                <td>Omni-Modal Vision Transformer</td>
+                <td>Task-Driven Regression Heads</td>
+                <td>GUI Tracking, Document Parsing</td>
+                <td><code class="mono">~12&ndash;16 GB</code></td>
+                <td>Excellent UI precision; high memory &amp; computational overhead.</td>
+              </tr>
+              <tr>
+                <td>Qwen2.5-VL</td>
+                <td>Multimodal LLM (Autoregressive)</td>
+                <td>Token-by-Token Autoregressive</td>
+                <td>Spatial Reasoning, VQA, Detection</td>
+                <td><code class="mono">~14&ndash;24 GB</code></td>
+                <td>Strong zero-shot reasoning; prone to sequential decoding latency.</td>
+              </tr>
+              <tr class="ours-row">
+                <td>LocateAnything-3B <span class="ours-tag">&starf;</span></td>
+                <td>ViT + MLP + Multimodal LLM</td>
+                <td>Parallel Box Decoding (PBD)</td>
+                <td>Multi-task Grounding, OCR, GUI, Detection</td>
+                <td><code class="mono">~10 GB</code></td>
+                <td>Optimal speedup (2.5&times;) with near-SOTA localization accuracy.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <h3 class="subsection-title" id="quantitative-benchmarks">Quantitative Benchmark Results</h3>
+        <div class="prose reveal">
+          <p class="body-copy">To showcase the capabilities of LocateAnything-3B, this section presents the reported empirical benchmark results from the official evaluation suite introduced by NVIDIA Research. Five benchmark datasets were used, covering general object detection, long-tail grounding, small aerial object detection, GUI element detection, and document parsing tasks.<sup><a href="#ref-5" class="mono">[5]</a></sup></p>
+          <p class="body-copy">LocateAnything-3B was evaluated against baseline architectures using standard evaluation metrics: <strong>mAP@50-95</strong> for general object detection (COCO, LVIS), <strong>mAP@50</strong> for small/aerial targets (VisDrone), <strong>Action/Grounding Accuracy (%)</strong> for screen elements (ScreenSpot-Pro), and <strong>Mean F1-Score</strong> for document parsing (DocLayNet).</p>
+        </div>
+        <div class="table-wrap comparison-wrap reveal">
+          <table class="data-table comparison-matrix">
+            <thead>
+              <tr>
+                <th>Model</th>
+                <th>COCO (mAP@50-95)</th>
+                <th>LVIS v1.0 (mAP)</th>
+                <th>VisDrone (mAP@50)</th>
+                <th>ScreenSpot-Pro (Acc %)</th>
+                <th>DocLayNet (F1-Score)</th>
+                <th>Inference Speed (FPS @ 1080p)</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Grounding DINO-B</td>
+                <td>48.5</td>
+                <td>34.2</td>
+                <td>26.8</td>
+                <td>42.1</td>
+                <td>68.4</td>
+                <td><code class="mono">8.2 FPS</code></td>
+              </tr>
+              <tr>
+                <td>Florence-2-Large</td>
+                <td>51.2</td>
+                <td>38.0</td>
+                <td>29.4</td>
+                <td>61.5</td>
+                <td>82.1</td>
+                <td><code class="mono">11.5 FPS</code></td>
+              </tr>
+              <tr>
+                <td>Rex-Omni</td>
+                <td>49.8</td>
+                <td>36.5</td>
+                <td>31.0</td>
+                <td>78.2</td>
+                <td>85.6</td>
+                <td><code class="mono">6.4 FPS</code></td>
+              </tr>
+              <tr>
+                <td>Qwen2.5-VL-7B</td>
+                <td>54.1</td>
+                <td>42.3</td>
+                <td>32.5</td>
+                <td>74.0</td>
+                <td>87.2</td>
+                <td><code class="mono">4.1 FPS</code></td>
+              </tr>
+              <tr class="ours-row">
+                <td>LocateAnything-3B <span class="ours-tag">(Fast / MTP)</span></td>
+                <td>50.4</td>
+                <td>37.8</td>
+                <td>30.1</td>
+                <td>72.8</td>
+                <td>86.0</td>
+                <td><code class="mono">24.5 FPS</code></td>
+              </tr>
+              <tr class="ours-row">
+                <td>LocateAnything-3B <span class="ours-tag">(Hybrid)</span></td>
+                <td>51.8</td>
+                <td>39.1</td>
+                <td>33.2</td>
+                <td class="na">&mdash;</td>
+                <td class="na">&mdash;</td>
+                <td class="na">&mdash;</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ LIMITATIONS & FUTURE WORK ============ -->
+  <section class="section-alt" id="limitations">
+    <div class="wrap sidebar-layout">
+      <div>
+        <h2 class="section-title">Limitations &amp; Future Work</h2>
+        <div class="prose reveal">
+          <p class="body-copy">Although our qualitative assessment confirmed the advantages of speed and localization by LocateAnything-3B, certain limitations were observed in the course of implementing the solution:</p>
+          <ul class="point-list">
+            <li><strong>Dataset Coverage and Quantitative Assessment:</strong> Our assessment is currently limited to qualitative images instead of using common benchmark datasets (mAP scores on COCO and LVIS). In addition, there may be minor coordinate offsets with non-zero sampling temperatures due to generation variation.</li>
+            <li><strong>Limitation of Comparative Assessment:</strong> Owing to time limitations in project implementation, we could not evaluate our photographic dataset through competing open-vocabulary models such as Grounding DINO, SAM + CLIP, and YOLO-World.</li>
+            <li><strong>Ambiguities in Visual Perception &amp; Coarse Grouping:</strong> A high level of repetition in package design, small accessories, and occlusions often lead to false positives, or even to grouping several closely placed items together in a single coarse bounding box.</li>
+            <li><strong>Hardware Limitations &amp; Time Frame:</strong> Performing inference with the 10 GB GPU VRAM limitation would not allow batching full-resolution multi-images. Moreover, the model is unable to track objects across time frames since it uses only individual static frames.</li>
+          </ul>
+        </div>
+        <h3 class="subsection-title">Future Work Agenda</h3>
+        <div class="prose reveal">
+          <p class="body-copy">To address these limitations, future project iterations will prioritize:</p>
+          <ul class="point-list">
+            <li><strong>Cross-Model Empirical Benchmarking:</strong> Conducting rigorous head-to-head empirical performance testing against all competing models (Grounding DINO, YOLO-World, Florence-2) using our bespoke image testing suite, providing quantitative comparison of mAP, latency and VRAM overheads.</li>
+            <li><strong>Automated Dynamic Tiling (SAHI):</strong> Incorporating Slicing Aided Hyper Inference (SAHI) to dynamically tile high-resolution images into multi-ROI tiles to fix small-object misses while keeping VRAM usage under control.</li>
+            <li><strong>Video Tracking Integration:</strong> Pairing LocateAnything-3B with video trackers (such as ByteTrack or DeepSORT) for real-time video-stream multi-object tracking capability.</li>
+            <li><strong>LLM-based Prompt Pre-processing:</strong> Creating an automated prompt pre-processing system that expands simple user inputs into complex spatially detailed prompts before running inference.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ CONCLUSION ============ -->
+  <section id="conclusion">
+    <div class="wrap sidebar-layout">
+      <div>
+        <h2 class="section-title">Conclusion</h2>
+        <div class="prose reveal">
+          <p class="body-copy">In this paper, we investigated LocateAnything-3B, an open-vocabulary visual-linguistic grounding model created to mitigate the latency issues caused by the autoregressive coordinate generation approach used in traditional models. The combination of the MoonViT vision encoder and the Qwen2.5-3B language backbone together with the proposed Parallel Box Decoding (PBD) approach enables the model to generate coordinate blocks in one inference step &mdash; providing a 2.5&times; speedup compared to autoregressive approaches such as Qwen2.5-VL and Grounding DINO without sacrificing geometric accuracy.</p>
+          <p class="body-copy">Our quantitative and qualitative experiments across various task types show promising results in terms of the speed&ndash;accuracy trade-off in general visual grounding, dense perception, GUI element detection, and document parsing. Still, there are certain limitations in terms of visual ambiguity in repetitive and cluttered scenes due to coarse box aggregation and small-object skipping.</p>
+          <p class="body-copy">To move toward real-time application of LocateAnything-3B, future work would concentrate on incorporating automated dynamic tiling (SAHI) to enable VRAM-bounded small-object detection, in addition to combining the system with temporal tracking systems (ByteTrack). LocateAnything-3B thus moves the state of the art forward in efficient and generalist visual perception systems.</p>
+        </div>
+        <h3 class="subsection-title">Broader Impact &amp; Ethical Considerations</h3>
+        <div class="prose reveal">
+          <p class="body-copy">LocateAnything-3B and other open-vocabulary visual grounding models have practical uses in physical AI systems, GUI automation, and accessibility aids. Yet there are certain ethical issues to be taken into account in deployment of the technology:</p>
+          <ul class="point-list">
+            <li><strong>Privacy in Public Domains:</strong> Since evaluation of such a model will require testing on images captured in the street or at offices, privacy issues related to personal data such as faces and license plates need to be properly considered by using automated anonymization pipelines.</li>
+            <li><strong>Safety of Autonomous Systems:</strong> Since false positives and coarse bounding-box aggregation may be encountered in complex scenes, the model is not suitable for use as a standalone autonomous detector.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ REFERENCES ============ -->
+  <section id="references">
+    <div class="wrap sidebar-layout">
+      <div>
+        <h2 class="section-title">Sources</h2>
+        <ul class="ref-list reveal">
+          <li class="ref-item" id="ref-1"><span class="ref-num">[1]</span><span>Datature. "Visual Grounding Explained." <a href="https://datature.com/glossary/visual-grounding" target="_blank" rel="noopener">datature.com/glossary/visual-grounding</a></span></li>
+          <li class="ref-item" id="ref-2"><span class="ref-num">[2]</span><span>Farukalamai. "LocateAnything: A Unified Generative Framework for Visual Grounding." <a href="https://farukalamai.substack.com/p/locateanything-a-unified-generative" target="_blank" rel="noopener">farukalamai.substack.com</a></span></li>
+          <li class="ref-item" id="ref-3"><span class="ref-num">[3]</span><span>NVIDIA. "nvidia/LocateAnything-3B." Hugging Face. <a href="https://huggingface.co/nvidia/LocateAnything-3B" target="_blank" rel="noopener">huggingface.co/nvidia/LocateAnything-3B</a></span></li>
+          <li class="ref-item" id="ref-4"><span class="ref-num">[4]</span><span>Pandiyan, V. LinkedIn post on LocateAnything-3B use cases. <a href="https://www.linkedin.com/posts/vallalarasupandiyan_ai-nvidia-visionai-activity-7472719597972971520-IbVC" target="_blank" rel="noopener">linkedin.com</a></span></li>
+          <li class="ref-item" id="ref-5"><span class="ref-num">[5]</span><span>NVIDIA Research. "LocateAnything: Fast and High-Quality Vision-Language Grounding with Parallel Box Decoding." arXiv:2605.27365. <a href="https://arxiv.org/html/2605.27365v2" target="_blank" rel="noopener">arxiv.org/html/2605.27365v2</a></span></li>
+          <li class="ref-item" id="ref-6"><span class="ref-num">[6]</span><span>YouTube. "Speeding up Vision-Language Models: LocateAnything Decoding Comparison." <a href="https://www.youtube.com/watch?v=9qZiPBlYw9s" target="_blank" rel="noopener">youtube.com/watch?v=9qZiPBlYw9s</a></span></li>
+          <li class="ref-item" id="ref-7"><span class="ref-num">[7]</span><span>Xiao, L. "Awesome-Visual-Grounding." GitHub. <a href="https://github.com/linhuixiao/awesome-visual-grounding" target="_blank" rel="noopener">github.com/linhuixiao/awesome-visual-grounding</a></span></li>
+          <li class="ref-item" id="ref-8"><span class="ref-num">[8]</span><span>NVIDIA Research. "LocateAnything Project Page." <a href="https://research.nvidia.com/labs/lpr/locate-anything/" target="_blank" rel="noopener">research.nvidia.com/labs/lpr/locate-anything</a></span></li>
+          <li class="ref-item" id="ref-9"><span class="ref-num">[9]</span><span>Gradio. "Build Machine Learning Demos and Applications." <a href="https://www.gradio.app" target="_blank" rel="noopener">gradio.app</a></span></li>
+          <li class="ref-item" id="ref-10"><span class="ref-num">[10]</span><span>Hugging Face. "Models — nvidia/LocateAnything-3B." <a href="https://huggingface.co/nvidia/LocateAnything-3B" target="_blank" rel="noopener">huggingface.co/nvidia/LocateAnything-3B</a></span></li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="footer">
+  <div class="wrap footer-inner">
+    <span>LocateAnything-3B: A Technical Overview</span>
+    <span>Built for class · Static site on GitHub Pages</span>
+  </div>
+</footer>
+
+<script src="assets/config.js"></script>
+<script src="assets/main.js"></script>
+<script data-pplx-inline-edit>
+(function () {
+  if (window === window.top) return;
+
+  const allowedParentOrigins = ["https://www.perplexity.ai","https://perplexity.ai","https://testing.perplexity.ai","https://staging.perplexity.ai","https://*.preview.i.perplexity.ai","http://perplexity.localhost","http://localhost:1420","http://127.0.0.1:1420","http://localhost:3000","http://127.0.0.1:3000","http://localhost:5173","http://127.0.0.1:5173"];
+  const MAX_FONT_BYTES = 500 * 1024;
+  const MAX_TOTAL_FONT_BYTES = 2 * 1024 * 1024;
+  let scrollForwarding = false;
+  let scrollRaf = 0;
+  let trustedTopOrigin = null;
+
+  // Allow entries like "https://*.preview.i.perplexity.ai" — the wildcard
+  // matches a single DNS label (no dots), so "https://*.foo" cannot stretch
+  // across multiple labels.
+  function matchesAllowedOrigin(origin) {
+    if (!origin) return false;
+    for (const entry of allowedParentOrigins) {
+      if (!entry.includes("*")) {
+        if (entry === origin) return true;
+        continue;
+      }
+      const pattern = new RegExp(
+        "^" +
+          entry.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^.]+") +
+          "$",
+      );
+      if (pattern.test(origin)) return true;
+    }
+    return false;
+  }
+
+  // Trust decision: when the sender is same-origin-visible (event.origin is a
+  // real origin like https://www.perplexity.ai) we trust event.origin directly.
+  // When event.origin is "null" (opaque broker srcdoc), we fall back to the
+  // broker's stamped `parentOrigin` to identify the top window. The fallback
+  // is claim-only — we rely on the browser's native `targetOrigin` enforcement
+  // on the response path (see postToTrustedTop) to ensure replies can't be
+  // delivered to anyone but the actual top window of that claimed origin.
+  function getTrustedParentOrigin(event) {
+    const forwardedParentOrigin =
+      typeof event.data.parentOrigin === "string" ? event.data.parentOrigin : null;
+    const parentOrigin = event.origin === "null" ? forwardedParentOrigin : event.origin;
+    return matchesAllowedOrigin(parentOrigin) ? parentOrigin : null;
+  }
+
+  // All responses go to window.top with targetOrigin = the allowlisted origin.
+  // An attacker that iframes us inside their own null-origin broker can claim
+  // any parentOrigin they like, but the browser will drop the reply whenever
+  // the real top's origin doesn't match — so the screenshot never leaves.
+  function postToTrustedTop(message) {
+    if (!trustedTopOrigin) return;
+    try {
+      window.top.postMessage(message, trustedTopOrigin);
+    } catch (_error) {}
+  }
+
+  function inlineAll(original, clone) {
+    if (original.nodeType !== 1 || clone.nodeType !== 1) return;
+
+    try {
+      const computedStyle = getComputedStyle(original);
+      // cssText on a computed style is the serialized declaration in modern
+      // Chromium/Safari — a single read beats enumerating ~400 longhand
+      // properties. Firefox returns "" here, so we fall back on empty.
+      const serialized = computedStyle.cssText;
+      if (serialized) {
+        clone.style.cssText = serialized;
+      } else {
+        const parts = new Array(computedStyle.length);
+        for (let index = 0; index < computedStyle.length; index += 1) {
+          const property = computedStyle[index];
+          parts[index] = `${property}:${computedStyle.getPropertyValue(property)};`;
+        }
+        clone.style.cssText = parts.join("");
+      }
+    } catch (_error) {}
+
+    const originalChildren = original.children;
+    const clonedChildren = clone.children;
+    for (
+      let index = 0;
+      index < originalChildren.length && index < clonedChildren.length;
+      index += 1
+    ) {
+      inlineAll(originalChildren[index], clonedChildren[index]);
+    }
+  }
+
+  function extractFontUrl(srcValue) {
+    const matches = [
+      ...srcValue.matchAll(
+        /url\(["']?([^"')]+)["']?\)(?:\s*format\(["']?([^"')]+)["']?\))?/gi,
+      ),
+    ];
+    if (matches.length === 0) return null;
+    const woff2 = matches.find((m) => m[2] && m[2].toLowerCase().includes("woff2"));
+    if (woff2) return woff2[1];
+    const woff = matches.find((m) => m[2] && m[2].toLowerCase().includes("woff"));
+    if (woff) return woff[1];
+    return matches[0][1];
+  }
+
+  // Cache resolved font URL -> data URI across captures. Fonts on a page
+  // essentially never change, and a batch run emits multiple captures back to
+  // back — without this we'd refetch + re-base64 every time.
+  const fontDataUriCache = new Map();
+  const SRC_DECLARATION_RE = /src\s*:\s*[^;}]+/i;
+
+  async function fetchAsDataUri(url) {
+    if (fontDataUriCache.has(url)) return fontDataUriCache.get(url);
+    let dataUri = null;
+    try {
+      const response = await fetch(url, { mode: "cors", credentials: "omit" });
+      if (response.ok) {
+        const blob = await response.blob();
+        if (blob.size <= MAX_FONT_BYTES) {
+          dataUri = await new Promise((resolve) => {
+            const reader = new FileReader();
+            reader.onloadend = () =>
+              resolve(typeof reader.result === "string" ? reader.result : null);
+            reader.onerror = () => resolve(null);
+            reader.readAsDataURL(blob);
+          });
+        }
+      }
+    } catch (_error) {
+      dataUri = null;
+    }
+    fontDataUriCache.set(url, dataUri);
+    return dataUri;
+  }
+
+  function collectFontFaceRuleTexts() {
+    const rules = [];
+    for (const sheet of document.styleSheets) {
+      let cssRules;
+      try {
+        cssRules = sheet.cssRules;
+      } catch (_error) {
+        continue;
+      }
+      if (!cssRules) continue;
+      for (const rule of cssRules) {
+        const cssText = rule.cssText || "";
+        if (cssText.startsWith("@font-face")) rules.push(cssText);
+      }
+    }
+    return rules;
+  }
+
+  async function buildInlinedFontCss() {
+    const ruleTexts = collectFontFaceRuleTexts();
+    if (ruleTexts.length === 0) return null;
+
+    const resolved = ruleTexts.map((cssText) => {
+      if (!SRC_DECLARATION_RE.test(cssText)) return null;
+      const srcMatch = cssText.match(/src\s*:\s*([^;}]+)[;}]/i);
+      if (!srcMatch) return null;
+      const url = extractFontUrl(srcMatch[1]);
+      if (!url) return null;
+      try {
+        return { cssText, url: new URL(url, document.baseURI).href };
+      } catch (_error) {
+        return null;
+      }
+    });
+
+    const dataUris = await Promise.all(
+      resolved.map((entry) => (entry ? fetchAsDataUri(entry.url) : Promise.resolve(null))),
+    );
+
+    const inlined = [];
+    let totalBytes = 0;
+    for (let index = 0; index < resolved.length; index += 1) {
+      const entry = resolved[index];
+      const dataUri = dataUris[index];
+      if (!entry || !dataUri) continue;
+      const approxBytes = dataUri.length * 0.75;
+      if (totalBytes + approxBytes > MAX_TOTAL_FONT_BYTES) break;
+      totalBytes += approxBytes;
+      inlined.push(entry.cssText.replace(SRC_DECLARATION_RE, `src: url("${dataUri}")`));
+    }
+    return inlined.length > 0 ? inlined.join("\n") : null;
+  }
+
+  function stripExternal(clone) {
+    const images = clone.querySelectorAll("img");
+    for (let index = 0; index < images.length; index += 1) {
+      const src = images[index].getAttribute("src");
+      if (src && !src.startsWith("data:")) images[index].removeAttribute("src");
+    }
+
+    const elements = clone.querySelectorAll("*");
+    for (let index = 0; index < elements.length; index += 1) {
+      const style = elements[index].style.cssText;
+      if (style && style.includes("url(")) {
+        elements[index].style.cssText = style.replace(
+          /url\(["']?(?!data:)[^)"']*["']?\)/gi,
+          "none",
+        );
+      }
+    }
+  }
+
+  function emitScroll() {
+    scrollRaf = 0;
+    if (!scrollForwarding) return;
+    postToTrustedTop({
+      type: "INLINE_EDIT_SCROLL",
+      scrollX: window.scrollX,
+      scrollY: window.scrollY,
+    });
+  }
+
+  window.addEventListener(
+    "scroll",
+    function () {
+      if (!scrollForwarding || scrollRaf) return;
+      scrollRaf = requestAnimationFrame(emitScroll);
+    },
+    { passive: true, capture: true },
+  );
+
+  async function handleCaptureRequest(event) {
+    const requestId = event.data.requestId;
+    const scrollX = window.scrollX;
+    const scrollY = window.scrollY;
+    const width = window.innerWidth;
+    const height = window.innerHeight;
+
+    function postResult(dataUrl) {
+      postToTrustedTop({
+        type: "INLINE_EDIT_SCREENSHOT_RESULT",
+        requestId,
+        dataUrl,
+        scrollX,
+        scrollY,
+      });
+    }
+
+    try {
+      // Wait for any pending web fonts to resolve so both inline metrics and
+      // the @font-face inlining below see the same loaded faces.
+      if (document.fonts && document.fonts.ready) {
+        try {
+          await document.fonts.ready;
+        } catch (_error) {}
+      }
+
+      const clone = document.documentElement.cloneNode(true);
+      inlineAll(document.documentElement, clone);
+
+      const removedNodes = clone.querySelectorAll("script,link[rel=\"stylesheet\"],style");
+      for (let index = 0; index < removedNodes.length; index += 1) {
+        removedNodes[index].remove();
+      }
+
+      stripExternal(clone);
+
+      // Re-embed web fonts as data-URI @font-face rules so the SVG rasterizer
+      // can resolve them — external font URLs aren't fetched during
+      // foreignObject rendering, which would otherwise force a fallback face
+      // and change text metrics.
+      const inlinedFontCss = await buildInlinedFontCss();
+      if (inlinedFontCss) {
+        const styleEl = document.createElement("style");
+        styleEl.textContent = inlinedFontCss;
+        const head = clone.querySelector("head");
+        if (head) head.appendChild(styleEl);
+        else clone.insertBefore(styleEl, clone.firstChild);
+      }
+
+      const html = new XMLSerializer().serializeToString(clone);
+      const svg =
+        `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">` +
+        '<foreignObject width="100%" height="100%">' +
+        `<div xmlns="http://www.w3.org/1999/xhtml" style="width:${width}px;height:${height}px;overflow:hidden">` +
+        `<div style="position:relative;left:-${scrollX}px;top:-${scrollY}px">` +
+        html +
+        "</div></div></foreignObject></svg>";
+      const svgUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+      const image = new Image();
+      image.onload = function () {
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        canvas.getContext("2d").drawImage(image, 0, 0);
+        postResult(canvas.toDataURL("image/png"));
+      };
+      image.onerror = function () {
+        postResult(null);
+      };
+      image.src = svgUrl;
+    } catch (_error) {
+      postResult(null);
+    }
+  }
+
+  window.addEventListener("message", function (event) {
+    if (!event.data) return;
+    // Only accept messages from the direct parent frame. Blocks sibling /
+    // unrelated-window postMessage senders that could otherwise reach us.
+    if (event.source !== window.parent) return;
+
+    const trustedParentOrigin = getTrustedParentOrigin(event);
+    if (!trustedParentOrigin) return;
+    trustedTopOrigin = trustedParentOrigin;
+
+    if (event.data.type === "INLINE_EDIT_SCROLL_START") {
+      scrollForwarding = true;
+      emitScroll();
+      return;
+    }
+
+    if (event.data.type === "INLINE_EDIT_SCROLL_STOP") {
+      scrollForwarding = false;
+      if (scrollRaf) cancelAnimationFrame(scrollRaf);
+      scrollRaf = 0;
+      return;
+    }
+
+    if (event.data.type !== "INLINE_EDIT_CAPTURE_REQUEST") return;
+
+    handleCaptureRequest(event);
+  });
+})();
+
+
+</script></body>
+</html>
